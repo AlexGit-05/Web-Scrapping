@@ -235,10 +235,9 @@ def upload_notice(engine):
     """
 
     # Usage
-    FROM = 'alex.dev868@gmail.com'
+    FROM = 'johndoe@gmail.com'
     TO = [
-        'wawerualex5483@gmail.com', 
-        # "KWamwangi@kengen.co.ke"
+        'johndoe1@gmail.com', 
         ]  # List of recipients
     SUBJECT = 'Recent Kenya Law Weekly Notice'
     SERVER = 'smtp.gmail.com'  
