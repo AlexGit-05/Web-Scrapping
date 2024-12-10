@@ -9,8 +9,9 @@ from sqlalchemy import create_engine, MetaData, Table, select
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from sqlalchemy import create_engine
+import logging
 from dotenv import load_dotenv
+from sqlalchemy import create_engine
 import base64
 
 # Initialize the parser and read the config file
@@ -21,6 +22,7 @@ username = base64.b64decode(os.getenv("USER_NAME")).decode('utf-8')
 password = base64.b64decode(os.getenv('PASSWORD')).decode('utf-8')
 host = os.getenv("HOST")
 port = os.getenv("PORT")
+email_pwd = os.getenv("EMAIL_PWD")
 
 # Define the connection string to the MySQL database using SQLAlchemy
 legal = f'mysql+pymysql://{username}:{password}@{host}:{port}/legal'
@@ -28,6 +30,23 @@ legal = f'mysql+pymysql://{username}:{password}@{host}:{port}/legal'
 # Create an SQLAlchemy engine object for connecting to the database
 engine = create_engine(legal)
 
+
+# Set up logging with absolute path
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(SCRIPT_DIR, 'gazette_scraper.log')
+DOWNLOAD_DIR = os.path.join(SCRIPT_DIR, 'downloads')
+
+# Create downloads directory if it doesn't exist
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+download_path = os.path.join(DOWNLOAD_DIR, 'download.pdf')
+
+# Configure logging
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 def scrape_kenya_gazettes():
     """
@@ -39,6 +58,9 @@ def scrape_kenya_gazettes():
             - date_string (str): Publication date as string
             - df (pd.DataFrame): DataFrame containing all gazette information
     """
+
+    logging.info("Starting gazette scraping process")
+
     # Specify url and get initial page
     base_url = "https://new.kenyalaw.org/gazettes/"
     try:
@@ -105,12 +127,12 @@ def scrape_kenya_gazettes():
                 response.raise_for_status()
                 
                 # Save PDF temporarily
-                with open("downloads/download.pdf", 'wb') as file:
+                with open(download_path, 'wb') as file:
                     for chunk in response.iter_content(chunk_size=8192):
                         file.write(chunk)
                 
                 # Extract and check content
-                doc = PdfReader("downloads/download.pdf")
+                doc = PdfReader(download_path)
                 tbl_content = doc.pages[0].extract_text()
                 
                 # Check for EPRA or "The Energy Act" mention
@@ -148,7 +170,14 @@ def scrape_kenya_gazettes():
                     except:
                         pass
         
-        return date, df
+        try:
+            # Your existing code...
+            logging.info(f"Successfully scraped gazette data for date: {date}")
+            return date, df
+        
+        except Exception as e:
+            logging.error(f"Failed to scrape gazette data: {str(e)}")
+            return None, None
         
     except Exception as e:
         print(f"Failed to scrape gazette data: {str(e)}")
@@ -156,7 +185,7 @@ def scrape_kenya_gazettes():
 
 ######################################################################################################################
 
-def send_mail(FROM, TO, SUBJECT, SERVER, PASSWORD, date_obj=None, data = None):
+def send_mail(FROM, TO, SUBJECT, SERVER, PASSWORD, date_obj=None, data=None):
     """
     Sends an email with the recent notice details (weekly and/or special).
 
@@ -177,8 +206,10 @@ def send_mail(FROM, TO, SUBJECT, SERVER, PASSWORD, date_obj=None, data = None):
     # Convert DataFrame to HTML table
     table_html = data.to_html(index=False, escape=False)
 
+    logging.info("Attempting to send email notification")
+    
     try:
-        # Create a multipart message
+         # Create a multipart message
         message = MIMEMultipart()
         message['From'] = FROM
         message['To'] = ", ".join(TO)
@@ -219,9 +250,12 @@ def send_mail(FROM, TO, SUBJECT, SERVER, PASSWORD, date_obj=None, data = None):
         server.sendmail(FROM, TO, message.as_string())
         server.quit()
         print("Email sent successfully!")
-
+        logging.info("Email sent successfully")
     except Exception as e:
         print(f"Failed to send email: {e}")
+        logging.error(f"Failed to send email: {str(e)}")
+        raise
+        
 
 ######################################################################################################################
 
@@ -234,52 +268,75 @@ def upload_notice(engine):
     If the notice is not already in the database, it adds the new notice.
     """
 
-    # Usage
-    FROM = 'johndoe@gmail.com'
-    TO = [
-        'johndoe1@gmail.com', 
-        ]  # List of recipients
-    SUBJECT = 'Recent Kenya Law Weekly Notice'
-    SERVER = 'smtp.gmail.com'  
-    PASSWORD = 'qiww ocvh erfw rots'   # App-specific password if 2FA is enabled
+    logging.info("Starting upload_notice process")
 
-    # Create a MetaData object (holds schema information for database reflection)
-    metadata = MetaData()
+    try:
+        # Email configuration - Consider moving these to environment variables
+        FROM = 'johndoe@gmail.com'
+        TO = [
+            'johndoe@gmail.com', 
+            ]  # List of recipients
+        SUBJECT = 'Recent Kenya Law Weekly Notice'
+        SERVER = 'smtp.gmail.com'
+        PASSWORD = email_pwd    # App-specific password if 2FA is enabled
 
-    # Reflect the 'weekly issues' table from the database using the engine
-    table = Table('gazett notice db', metadata, autoload_with=engine)
+        # Create a MetaData object (holds schema information for database reflection)
+        metadata = MetaData()
 
-    # Re-extract the notice information
-    Date, df = scrape_kenya_gazettes()
+        # Reflect the 'weekly issues' table from the database using the engine
+        table = Table('gazett notice db', metadata, autoload_with=engine)
 
-    # Check if the notice date is not None (meaning the notice exists)
-    if Date is not None:
-        # Create a connection to the database
-        with engine.connect() as connection:
-            # Define a select query to check if the notice date already exists in the database
-            query = select(table.c.Date).where(table.c.Date == Date)
+        # Re-extract the notice information
+        Date, df = scrape_kenya_gazettes()
 
-            result = connection.execute(query).fetchone()  # Execute the query and fetch one result
+        # Check if the notice date is not None (meaning the notice exists)
+        if Date is not None:
+            # Create a connection to the database
+            with engine.connect() as connection:
+                # Define a select query to check if the notice date already exists in the database
+                query = select(table.c.Date).where(table.c.Date == Date)
+
+                result = connection.execute(query).fetchone()  # Execute the query and fetch one result
 
 
-        # Check if either weekly or special notice data is missing in the database
-        if not result:
-            # Send the email with the available notice data (could be both or one)
-            send_mail(
-                FROM, TO, SUBJECT, 
-                date_obj=Date if not result else None, data=df if not result else None, 
-                SERVER=SERVER, PASSWORD=PASSWORD
-            )
-
-            # Upload the weekly notice data if it's new
+            # Check if either weekly or special notice data is missing in the database
             if not result:
-                # Re-extract the notice information
-                Date, df = scrape_kenya_gazettes()
-                df.to_sql(name='gazett notice db', con=engine, if_exists='append', index=False)
+                # Send the email with the available notice data (could be both or one)
+                logging.info(f"New gazette found for date: {Date}")
+                send_mail(
+                    FROM, TO, SUBJECT, 
+                    date_obj=Date if not result else None, data=df if not result else None, 
+                    SERVER=SERVER, PASSWORD=PASSWORD
+                )
 
+                # Upload the weekly notice data if it's new
+                if not result:
+                    # Re-extract the notice information
+                    Date, df = scrape_kenya_gazettes()
+                    df.to_sql(name='gazett notice db', con=engine, if_exists='append', index=False)
+                    logging.info("Successfully uploaded new gazette to database")
+                else:
+                    logging.info("No new gazette notices to process")
+        else:
+                logging.warning("No gazette data retrieved")
+            
+    except Exception as e:
+        logging.error(f"Error in upload_notice: {str(e)}")
+        raise
             
 
 ######################################################################################################################       
 
-# Extract the recent weekly notice and send via email then upload to bd
-upload_notice(engine)
+def main():
+    """Main function to run the script"""
+    try:
+        logging.info("Starting gazette scraper script")
+        upload_notice(engine)
+        logging.info("Script completed successfully")
+    except Exception as e:
+        logging.error(f"Script failed with error: {str(e)}")
+        # Optionally send error notification email here
+        raise
+
+if __name__ == "__main__":
+    main()
