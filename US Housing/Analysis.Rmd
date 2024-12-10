@@ -1,0 +1,481 @@
+---
+title: "Data Mining and Analysis"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+library(tidyverse)
+library(mice)
+library(corrplot)
+library(gridExtra)
+library(cluster)
+library(fastDummies)
+library(stringr)
+```
+
+
+## Loading data
+```{r}
+#Loading data
+Zillow = read.csv("zillow.csv")
+
+Zillow = Zillow %>% 
+  select(Column.0, Column.1) %>% 
+  rename(Address = "Column.0", Rooms = "Column.1") %>% 
+  distinct() # Removing duplicated values
+
+head(Zillow)
+```
+
+```{r}
+Apartments = read.csv("Apartment.csv")
+
+Apartments = Apartments %>% 
+  select(address, rent, rooms) %>% 
+  rename(Address="address", Rent="rent", Rooms="rooms") %>% 
+  distinct() # Removing duplicated values
+
+head(Apartments)
+```
+
+The process began with loading two key datasets: Zillow and Apartments. For the Zillow dataset, the data was loaded from 'zillow.csv' using the read.csv function in R. This step was followed by selecting and renaming relevant columns: 'Column.0' and 'Column.1' were renamed to 'Address' and 'Rooms', respectively, for better clarity. Additionally, duplicate entries were removed to ensure the uniqueness of each record. A preview of this dataset was obtained using head(Zillow) to confirm the success of these initial steps.
+
+Similarly, the Apartments dataset was loaded from 'Apartment.csv', also using the read.csv function. The data was then processed by selecting pertinent columns: 'address', 'rent', and 'rooms', which were subsequently renamed to 'Address', 'Rent', and 'Rooms'. This renaming aimed to standardize the column names across both datasets. Like the Zillow dataset, duplicates were removed to maintain data integrity, and the first few rows of the dataset were displayed using head(Apartments) to verify the changes.
+
+This initial phase of data loading and inspection set a strong foundation for the ensuing data transformation and analysis. It ensured that both datasets were optimally structured and cleaned for a comprehensive and accurate comparative analysis.
+
+## Data Cleaning  
+
+```{r}
+split_address = function(df, address_col_name) {
+    # Check if the specified address column exists in the dataframe
+    if(!address_col_name %in% names(df)) {
+        stop("The specified column does not exist in the dataframe.")
+    }
+    
+    # Initialize new columns
+    df$street = NA
+    df$city = NA
+    df$state = NA
+
+    for (i in 1:nrow(df)) {
+        # Split the address in the current row
+        address_parts = str_split(df[[address_col_name]][i], ", ") %>% unlist()
+
+        # Assign Street, City, and State based on the split parts
+        df$street[i] = ifelse(length(address_parts) == 3, address_parts[1],
+                              ifelse(length(address_parts) == 4, 
+                              paste(address_parts[1],"|",address_parts[2]),
+                              NA))
+        df$city[i] = ifelse(length(address_parts) >= 3,
+                            address_parts[length(address_parts)-1], NA)
+        df$state[i] = ifelse(length(address_parts) >= 3,
+                             address_parts[length(address_parts)], NA)
+    }
+
+    return(df)
+}
+
+Zillow = split_address(Zillow, "Address") %>%  select(- Address)
+Apartments = split_address(Apartments, "Address") %>%  select(- Address)
+```
+
+The data cleaning process began with the modification of the address fields in both the Zillow and Apartments datasets. A custom R function, split_address, was employed for this purpose. This function checked for the existence of the address column and, if present, split the address into three new columns: 'street', 'city', and 'state'. For each entry, the address was split on commas, and the components were assigned to these new columns. Special handling was included for addresses with varying lengths to ensure accurate assignment. After splitting, the original 'Address' column was removed from both datasets.
+
+```{r Zillow cleaning}
+process_rooms_data = function(df, column_name) {
+    # Check if the column exists
+    if (!column_name %in% names(df)) {
+        stop("The specified column does not exist in the dataframe.")
+    }
+
+    # Initialize new columns
+    df$Rent = NA
+    df$Room = NA
+
+    for (i in 1:nrow(df)) {
+        # Split the string at '+'
+        parts = str_split(df[[column_name]][i], "\\+") %>% unlist()
+
+        # Extract Rent and Rooms
+        rent = trimws(parts[1])  # Remove any leading/trailing whitespace
+        rooms = ifelse(length(parts) > 1, trimws(parts[2]), "0")  
+
+        # Replace 'Studio' with '0' and remove 'bd' and 'bds'
+        rooms = gsub("Studio", "0", rooms)
+        rooms = gsub("bds?", "", rooms, perl = TRUE)  
+
+        # Assign values to new columns
+        df$Rent[i] = rent
+        df$Room[i] = rooms
+    }
+
+    return(df)
+}
+
+Zillow = process_rooms_data(Zillow, "Rooms") %>% 
+  select(- Rooms) %>% 
+  # Cleaning and converting to numeric
+  mutate(
+    Rent = as.numeric(gsub("[$,/mo]", "", Rent)),
+    Room = as.numeric(gsub("/mo", NA, Room))
+  ) %>% 
+  rename(Rooms = "Room")
+
+Zillow = Zillow[c("state", "city", "street", "Rooms", "Rent")]
+```
+
+For the Zillow dataset, a specific focus was placed on the 'Rooms' column, which contained combined information about rent and room numbers. A function named process_rooms_data was created to split this column into two separate columns: 'Rent' and 'Room'. The function handled various formats, such as replacing 'Studio' with '0' and removing 'bd' and 'bds' from the room information. Subsequently, the 'Rent' and 'Room' data were cleaned of any non-numeric characters and converted into numeric format. The resulting dataset included state, city, street, room number, and rent.
+
+```{r Apartment cleaning}
+# Split Rows with '-' in Rent, Bedrooms
+split_and_expand_rows = function(df) {
+  rows_list = list()
+  for (i in 1:nrow(df)) {
+    row = df[i, ]
+    Rents = strsplit(as.character(row$Rent), " - ")[[1]]
+    bedrooms = strsplit(as.character(row$Rooms), " - |-")[[1]]
+    
+    
+    max_length = max(length(Rents), length(bedrooms))
+    Rents = rep(Rents, length.out = max_length)
+    bedrooms = rep(bedrooms, length.out = max_length)
+    
+    for (j in 1:max_length) {
+      row_expanded = row
+      row_expanded$Rent = Rents[j]
+      row_expanded$Rooms = bedrooms[j]
+      rows_list[[length(rows_list) + 1]] = row_expanded
+    }
+  }
+  do.call("rbind", rows_list)
+}
+
+Apartments =  split_and_expand_rows(Apartments) %>%
+  # Cleaning and converting to numeric
+  mutate(
+    Rent = as.numeric(gsub("[$,]", "", Rent)),
+    Rooms = gsub("Studio", 0, Rooms),
+    Rooms= as.numeric(gsub(" Beds| Bed", "", Rooms))
+  )
+Apartments = Apartments[c("state", "city", "street", "Rooms", "Rent")]
+
+```
+
+In the Apartments dataset, rows containing ranges in the 'Rent' and 'Rooms' columns (indicated by '-') were expanded into separate rows for each value within the range, using the split_and_expand_rows function. This expansion resulted in a more granular and detailed dataset. Following this, the 'Rent' and 'Rooms' columns were cleaned and converted into numeric formats, with specific replacements like converting 'Studio' to '0'. The final cleaned Apartments dataset also consisted of state, city, street, room number, and rent.
+
+```{r}
+# Merging the data 
+Housing = rbind(Zillow, Apartments)
+
+# remove rows with missing values in state city and street
+Housing = Housing[complete.cases(Housing[c("state", "city", 
+                                           "street", "Rooms")]),]
+
+# Number of missing data
+Housing %>% is.na() %>% any()
+
+# Number of missing values in the variables
+Housing%>% is.na() %>% colSums()
+
+# Show rows with any missing values
+Housing[!complete.cases(Housing),]
+
+# Extract row indices with missing data
+missing_indices <- which(apply(Housing, 1, function(x) any(is.na(x))))
+
+```
+Finally, the two cleaned datasets, Zillow and Apartments, were merged into a single dataset named 'Housing' using the rbind function. To ensure data quality and consistency, rows with missing values in key columns ('state', 'city', 'street', 'Rooms') were removed. The completeness of the merged dataset was then assessed to check for any remaining missing data, and a count of missing values across different columns was performed.Rent was found to have 24 missing values. This step ensured the creation of a comprehensive and clean housing dataset, ready for subsequent analysis or application.
+
+### Missinag value imputation
+```{r message=F}
+# imputing Rent using population
+Imputing_data = Housing %>% select(Rooms, Rent)
+
+# Setting up the method for each column
+method = make.method(Imputing_data)
+method["Rent"] = "norm.predict"  # Bayesian linear regression for 'total_bedrooms'
+
+# Performing the imputation
+imputedData = mice(Imputing_data, method=method, m=5, maxit=10)
+
+# Extracting the first imputed dataset
+completedData = complete(imputedData, 1)
+
+# Replacing Rent with the complete Rent
+Housing$Rent = completedData$Rent
+
+# Number of missing values in the variables
+Housing %>% is.na() %>% colSums()
+
+# imputed rows
+Housing[missing_indices,]
+```
+
+The missing value imputation process for the 'Rent' variable in the housing dataset was executed using the Multiple Imputation by Chained Equations (MICE) technique in R. This technique is particularly useful for dealing with datasets where multiple variables have missing values, as it creates several imputed datasets, iteratively filling missing values in each. In your script, the method 'norm.predict' was specified for the 'Rent' variable, which employs Bayesian linear regression for imputation. This method was chosen due to its effectiveness in predicting missing values in a numerical variable based on other numerical variables (in this case, 'Rooms'). After setting up the imputation process with 5 multiple imputations and a maximum of 10 iterations, the first imputed dataset was extracted and used to replace the missing 'Rent' values in the original dataset. This approach effectively minimized the missing values in the 'Rent' column, ensuring a more complete and reliable dataset for further analysis.
+
+```{r}
+Final_data = Housing
+
+# Structure of the data
+Final_data %>% str()
+
+# Factors 
+Var = names(Final_data)[c(1,2,3)]
+Final_data[Var] = lapply(Final_data[Var], as.factor)
+
+summary(Final_data)
+```
+The Final_data dataset, derived from the Housing dataset, is well-curated with 2,051 observations and five key variables: state, city, street, Rooms, and Rent. Notably, state, city, and street have been astutely transformed into categorical data types, enhancing their suitability for statistical analysis and visualization. A closer look at the dataset reveals a predominance of properties in California, particularly in Los Angeles, and a diverse range of street addresses. The Rooms variable shows a typical range from 0 to 6 rooms, with a majority featuring around one room, indicating a prevalence of smaller properties. The Rent varies considerably, from as low as 750 to as high as 52,345, reflecting a broad spectrum of rental properties. This comprehensive dataset, with its insightful summary and structured categorization, is poised to facilitate detailed analysis of the housing market, capturing nuances in location, property size, and pricing.
+
+### Checking and Removing Outliers
+```{r}
+# Selecting numeric variables
+Num = Final_data %>% select(where(is.numeric)) %>% 
+  colnames()
+
+# Eliminating outliers
+for (i in Num) {
+  # Identify outliers using IQR method
+  Q1 = quantile(Final_data[,i], 0.25)
+  Q3 = quantile(Final_data[,i], 0.75)
+  IQR = Q3 - Q1
+  lower_bound = Q1 - 1.5 * IQR
+  upper_bound = Q3 + 1.5 * IQR
+  
+  #filtering the Dataset 
+  Final_data = Final_data[which(Final_data[,i] > lower_bound & 
+                                    Final_data[,i] < upper_bound),]
+}
+```
+
+A meticulous approach to identify and remove outliers from the Final_data dataset, focusing on numeric variables like Rooms and Rent. This is achieved through the Interquartile Range (IQR) method. Initially, numeric variables are identified and isolated. Then, for each, the first and third quartiles (Q1, Q3) are calculated to determine the IQR. Utilizing this range, lower and upper bounds for outlier detection are set as Q1 - 1.5 * IQR and Q3 + 1.5 * IQR. Data points lying outside these bounds are considered outliers and are filtered out. This technique is particularly effective in mitigating the skewing effects of significantly divergent observations, thus focusing on the central tendency of the data. The outcome is a refined Final_data dataset, stripped of extreme values, which lends itself to more accurate and reliable statistical analysis. This process is a foundational step in preparing the dataset for subsequent analyses, ensuring the data under study represents a true and consistent picture of the underlying trends and patterns.
+
+## Data Visualization
+
+### Univariate Analysis
+```{r}
+# Prepare data for the top 15 cities
+top_cities = Final_data %>%
+  count(city) %>%
+  top_n(15, wt = n)
+
+# 15 least frequent cities
+least_cities = Final_data %>%
+  count(city) %>%
+  slice_min(order_by = n, n = 15)
+
+# Histogram for Rent
+p1 = ggplot(Final_data, aes(x=Rent)) +
+      geom_histogram(bins=30, fill="blue", color="black") +
+      ggtitle("Histogram of Rent") +
+      xlab("Rent") +
+      ylab("Frequency")
+
+# Bar plot for Bedrooms
+p2 = ggplot(Final_data, aes(x=Rooms)) +
+      geom_bar(fill="orange", color="black") +
+      ggtitle("Bar Plot of Bedrooms") +
+      xlab("Bedrooms") +
+      ylab("Frequency")
+
+# Bar plot for Top 15 Cities
+p3 = ggplot(top_cities, aes(x=reorder(city, n), y=n)) +
+      geom_bar(stat="identity", fill="purple") +
+      ggtitle("Bar Plot of Top 15 Cities") +
+      xlab("City") +
+      ylab("Count") +
+      coord_flip() 
+
+# Bar plot for least 15 Cities
+p4 = ggplot(least_cities, aes(x=reorder(city, n), y=n)) +
+      geom_bar(stat="identity", fill="green") +
+      ggtitle("Bar Plot of Least 15 Cities") +
+      xlab("City") +
+      ylab("Count") +
+      coord_flip() 
+
+# Combine plots
+grid.arrange(p1, p2, p3, p4, nrow=2, ncol=2)
+```
+
+Histogram of Rent
+The distribution of rent amounts shows a right-skewed pattern. This indicates that a larger number of properties have lower rent, while fewer properties have very high rent.
+The majority of rents fall within a certain range, suggesting a common market rate for most properties. The presence of some properties with significantly higher rent points towards luxury or high-end accommodations.
+
+Bar Plot of Bedrooms (Rooms)
+The frequency of different bedroom numbers shows a varied distribution. Properties with fewer bedrooms (studio and one-bedroom apartments) are more common.
+As the number of bedrooms increases, the frequency decreases, indicating fewer larger properties (like 3 or more bedrooms) in the dataset. This might reflect the common housing types in the area or the nature of properties listed.
+
+Bar Plot of Top 15 Cities
+The bar plot for the top 15 cities reveals the cities with the highest number of listings in the dataset. This could indicate larger rental markets or areas with higher population density.
+Los Angeles stands out as the city with the most listings, significantly more than other cities. This suggests a larger and possibly more dynamic rental market in Los Angeles.
+
+Bar Plot of Least 15 Cities
+The least frequent cities plot shows those with the fewest listings. These cities might represent smaller markets, rural areas, or less populated regions.
+The low frequency could also be due to the specific focus of the dataset or limited data availability from these areas.
+
+```{r}
+# top 15 cities with the highest average rent
+top_cities_avg_Rent = Final_data %>%
+  group_by(city) %>%
+  summarize(Avg_Rent = mean(Rent, na.rm = TRUE)) %>%
+  arrange(desc(Avg_Rent)) %>%
+  slice_head(n = 15)
+
+least_cities_avg_Rent = Final_data %>%
+  group_by(city) %>%
+  summarize(Avg_Rent = mean(Rent, na.rm = TRUE)) %>%
+  arrange(Avg_Rent) %>%
+  slice_head(n = 15)
+
+# Box Plot for Rent vs. Bedrooms with different colors
+p1 = ggplot(Final_data, aes(x=factor(Rooms), 
+                             y=Rent, fill=factor(Rooms))) +
+      geom_boxplot() +
+      ggtitle("Rent vs. Bedrooms") +
+      xlab("Bedrooms") +
+      ylab("Rent")
+
+# Bar Plot top 15 cities with the highest average rent with gradient color
+p2 = ggplot(top_cities_avg_Rent, aes(x=reorder(city, Avg_Rent), y=Avg_Rent, fill=Avg_Rent)) +
+      geom_bar(stat="identity") +
+      geom_text(aes(label=round(Avg_Rent, 2)), 
+                position=position_dodge(width=0.9), vjust=0.5, hjust=1) +
+      scale_fill_gradient(low="purple", high="pink") +
+      coord_flip() +
+      ggtitle("Top 15 Cities with the Highest Average Rent") +
+      xlab("City") +
+      ylab("Average Rent")
+
+p3 = ggplot(least_cities_avg_Rent, aes(x=reorder(city, Avg_Rent), y=Avg_Rent, fill=Avg_Rent)) +
+      geom_bar(stat="identity") +
+      geom_text(aes(label=round(Avg_Rent, 2)), 
+                position=position_dodge(width=0.9),  vjust=0.5, hjust=1) +
+      scale_fill_gradient(low="green", high="yellow") +
+      coord_flip() +
+      ggtitle("Top 15 Cities with the Lowest Average Rent") +
+      xlab("City") +
+      ylab("Average Rent")
+
+# Combine plots
+grid.arrange(p1, p2, p3, nrow=2, ncol=2)
+```
+
+Rent vs. Bedrooms (Box Plot)
+This plot displays the range of rent prices for different numbers of bedrooms. It reveals variations and distributions within each bedroom category, showing median, quartiles, and potential outliers.
+The variation in rent tends to increase with the number of bedrooms, suggesting a wider range of rent prices for properties with more bedrooms.
+
+Top 15 Cities with the Highest Average Rent (Bar Plot)
+This plot highlights the cities with the highest average rent. The bars are color-graded, and the exact average rent values are annotated on each bar.
+The visualization shows significant variations in average rent across different cities, indicating how rent levels might reflect the cost of living or the demand in these areas.
+
+Top 15 Cities with the Lowest Average Rent (Bar Plot)
+Conversely, this plot shows cities with the lowest average rent, using a different color gradient.
+These cities may represent more affordable living options or different market conditions compared to those with higher rents.
+
+```{r correlation}
+cor.test(Final_data$Rooms, Final_data$Rent)
+```
+
+The correlation coefficient of about 0.623 indicates a moderate positive correlation between the number of rooms and the rent. This suggests that, generally, as the number of rooms in a property increases, the rent also tends to increase.
+
+The extremely low p-value signifies that this correlation is statistically significant, meaning it's very unlikely that this correlation occurred by chance in this dataset.
+
+```{r}
+# Count the number of houses in each city and filter for those with more than 19 houses
+cities_9_houses = Final_data %>%
+  group_by(city) %>%
+  summarise(Count = n()) %>%
+  filter(Count >= 20)
+
+# Selecting rows from data where city has more than 9 houses
+Data = Final_data %>%
+  filter(city %in% cities_9_houses$city)
+
+# View the first few rows of the selected data
+head(Data)
+```
+
+The data was filtered to include only those cities with more than 19 houses
+
+
+```{r}
+Data %>%
+  ggplot(aes(x=city, y=Rent, fill=factor(Rooms))) +
+  geom_boxplot(outlier.shape = NA, 
+               fatten = 1.5) + 
+  theme_minimal(base_size = 12) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), # Rotate x-axis labels
+        panel.background = element_rect(fill = "white", colour = "black"), 
+        panel.grid.major = element_line(colour = "grey"), 
+        panel.grid.minor = element_blank()) +
+  ggtitle("Boxplot of Rent by City and Number of Rooms") +
+  xlab("City") +
+  ylab("Rent")
+```
+
+The boxplot of Rent by City and Number of Rooms offers several key insights into the housing market across different cities
+
+Variability in Rent Across Cities: Each city shows a distinct range of rent prices, indicating variability in housing costs. Some cities exhibit wider rent ranges, suggesting a diverse mix of housing options, from more affordable to luxury properties. In contrast, other cities show a narrower range, indicating a more uniform cost of living.
+Median Rent Trends: The median rent, represented by the line within each box, varies significantly from city to city. This variation reflects the economic diversity across these locations, with some cities having notably higher median rents, possibly due to higher living costs or more upscale housing markets.
+Impact of Number of Rooms: The differentiation in rent prices by the number of rooms within each city indicates how property size influences rent. Generally, properties with more rooms tend to have higher rents. However, the degree of this effect varies by city, with some showing a more pronounced increase in rent with additional rooms than others.
+Presence of Outliers: While the main focus is on the interquartile range, the presence of outliers (extreme values) in several cities suggests that there are properties with rents significantly different from the average. These could be either exceptionally high-priced luxury properties or, conversely, very affordable options.
+Overall, this plot provides a comprehensive view of how rent varies not just with location but also with the size of the property, offering valuable insights for potential renters, real estate analysts, and policymakers.
+
+## Data Mining
+
+```{r}
+Data1 = Data %>% select(-street, - state)
+
+# Dummify the 'City' column
+Data1 = dummy_cols(Data1, select_columns = "city", remove_selected_columns = TRUE)
+
+
+# Elbow Method
+wss = sapply(1:10, function(k){kmeans(Data1, k, nstart = 10)$tot.withinss})
+
+plot(1:10, wss, type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K", 
+     ylab="Total within-clusters sum of squares")
+
+#KMeans Clustering
+set.seed(42)
+k = 4
+km_result = kmeans(Data1, centers = k, nstart = 10)
+
+Data$Cluster = km_result$cluster
+
+cluster_summary = Data %>% 
+  select(Num, Cluster) %>% 
+  group_by(Cluster) %>%
+  summarise_all(list(mean = ~mean(., na.rm = TRUE), 
+                     sd = ~sd(., na.rm = TRUE), 
+                     min = ~min(., na.rm = TRUE), 
+                     max = ~max(., na.rm = TRUE)))
+cluster_summary
+```
+
+In the data mining process, the dataset underwent preparation by removing irrelevant columns like 'street' and 'state', followed by dummification of the 'city' column to convert categorical data into binary columns. Subsequently, the Elbow Method was employed to determine the optimal number of clusters for k-means clustering, revealing a potential clustering structure within the data. With the optimal k value obtained, k-means clustering was executed to group the data into distinct clusters. Finally, summary statistics including mean, standard deviation, minimum, and maximum values were computed for numerical variables within each cluster, providing insights into the characteristics and variations across the identified clusters. This comprehensive approach enables the exploration and understanding of underlying patterns and structures within the dataset, facilitating informed decision-making processes.
+
+Cluster 1: This cluster represents properties with a lower number of rooms, with a mean of approximately 0.31 rooms. The average rent in this cluster is around 1870.296, with relatively lower variability compared to other clusters. Rent prices range from 750 to 2253 within this cluster.
+
+Cluster 2: Properties in this cluster have an average of around 1.64 rooms, with a higher average rent of 3609.641. The variability in both room count and rent prices is slightly higher compared to Cluster 1. Rent prices within this cluster range from 3127 to 4220.
+
+Cluster 3: This cluster represents properties with an average of approximately 2.09 rooms, with the highest average rent among all clusters, standing at 4871.887. The variability in both room count and rent prices within this cluster is moderate. Rent prices range from 4260 to 5938.
+
+Cluster 4: Properties in this cluster have an average of around 0.80 rooms, with an average rent of 2641.739. The variability in both room count and rent prices is similar to Cluster 1. Rent prices within this cluster range from 2259 to 3125.
+
+```{r}
+# Rent prediction model
+Model = lm(Rent ~ Rooms + city, data = Data)
+
+# Model summary
+summary(Model)
+```
+
+The linear regression model constructed aims to predict rent based on the number of rooms and the city in which the property is located. The model coefficients reveal insightful trends: for each additional room, the rent increases by approximately 616.48, holding the city constant. Moreover, the model incorporates the impact of residing in different cities on rent prices. For instance, compared to a reference city, Glendale demonstrates a substantial increase in rent by 676.10, while Hollywood and Marina Del Rey also exhibit significant positive effects on rent, with increases of 444.83 and 692.19, respectively. These coefficients underscore the importance of both property size and location in determining rent prices, reflecting the intricate interplay between housing attributes and regional market dynamics.
+
+Analyzing the statistical significance of the model's predictors, it becomes evident that the number of rooms and several city variables hold substantial importance in predicting rent. The p-values associated with these predictors are notably low, indicating strong statistical significance. Conversely, certain city variables such as Encino, North Hollywood, and Studio City show p-values exceeding the conventional threshold of 0.05, suggesting less significant effects on rent. Overall, the model demonstrates moderate explanatory power, with an R-squared value of 0.4269, signifying that approximately 42.69% of the variance in rent can be accounted for by the included predictors. Despite its statistical significance, the model may benefit from further refinement to capture additional factors influencing rent prices, thereby enhancing its predictive accuracy and robustness in real-world applications.
